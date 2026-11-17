@@ -93,8 +93,7 @@
     item.streamable !== false &&
     item.policy !== "SNIP" &&
     item.policy !== "BLOCK" &&
-    item.access !== "blocked" &&
-    item.embeddable_by !== "none";
+    item.access !== "blocked";
 
   const isTalky = (title) =>
     /\b(podcast|podcast episode|episode|interview|audiobook|dj set|live set)\b/i.test(
@@ -120,13 +119,23 @@
     if (duration > 600 && /\bmix\b/i.test(title)) return null;
 
     // Каталог отдаёт транскодинги уже в результатах поиска — сохраняем
-    // ссылку, чтобы для запуска трека хватило одного запроса вместо двух.
+    // ссылки, чтобы для запуска трека хватило одного запроса вместо двух.
     const transcodings = Array.isArray(item.media && item.media.transcodings)
       ? item.media.transcodings
       : [];
-    const stream = pickTranscoding(transcodings, item.policy);
-    // Превью, запрет и шифрованный HLS (нужен DRM-ключ) в каталог не берём.
-    if (transcodings.length && !stream) return null;
+    const streams = transcodingCandidates(transcodings, item.policy);
+    // Шифрованный HLS (Widevine/FairPlay) напрямую не играет, но официальный
+    // плеер умеет его открывать — такие треки оставляем и уводим в фолбэк.
+    const encrypted =
+      !streams.length &&
+      item.embeddable_by !== "none" &&
+      transcodings.some(
+        (transcoding) =>
+          /encrypted-hls/i.test(String(transcoding?.format?.protocol || "")) &&
+          transcoding.snipped !== true
+      );
+    // Превью, запрет и треки без единого потока в каталог не берём.
+    if (transcodings.length && !streams.length && !encrypted) return null;
 
     return {
       id,
@@ -138,29 +147,44 @@
       genre: item.genre || "",
       plays: Number(item.playback_count) || 0,
       album: null,
-      stream,
+      stream: streams[0] || null,
+      // Все варианты потока: если первый не отдался, пробуем следующие.
+      streams,
+      drm: encrypted,
     };
   };
 
-  function pickTranscoding(list, policy) {
+  // Порядок предпочтения HLS-пресетов: сначала лучшее качество.
+  const TRANSCODING_PRIORITY = { aac_160k: 0, aac_96k: 1, abr_sq: 2 };
+
+  // Все пригодные для браузера варианты потока по убыванию качества.
+  function transcodingCandidates(list, policy) {
     // SNIP/BLOCK — это 30-секундные превью, полный трек так не отдадут.
     const access = String(policy || "ALLOW").toUpperCase();
-    if (access === "SNIP" || access === "BLOCK") return null;
-    if (!Array.isArray(list)) return null;
+    if (access === "SNIP" || access === "BLOCK") return [];
+    if (!Array.isArray(list)) return [];
 
-    const progressive = list.find(
-      (item) =>
-        item?.format?.protocol === "progressive" &&
-        /mpeg|mp3/i.test(String(item.format.mime_type || ""))
-    );
-    const hls =
-      list.find(
-        (item) => item?.format?.protocol === "hls" && item.preset === "aac_160k"
-      ) || list.find((item) => item?.format?.protocol === "hls");
+    const usable = list.filter((item) => {
+      if (!item || !item.url || item.snipped) return false;
+      const protocol = String(item?.format?.protocol || "");
+      if (protocol === "progressive") {
+        return /mpeg|mp3/i.test(String(item.format.mime_type || ""));
+      }
+      return protocol === "hls";
+    });
 
-    const chosen = progressive || hls;
-    if (!chosen || !chosen.url || chosen.snipped) return null;
-    return { url: chosen.url, hls: chosen.format.protocol === "hls" };
+    const rank = (item) => {
+      if (item.format.protocol === "progressive") return -1;
+      return TRANSCODING_PRIORITY[item.preset] ?? 9;
+    };
+
+    return [...usable]
+      .sort((a, b) => rank(a) - rank(b))
+      .map((item) => ({ url: item.url, hls: item.format.protocol === "hls" }));
+  }
+
+  function pickTranscoding(list, policy) {
+    return transcodingCandidates(list, policy)[0] || null;
   }
 
   const dedupe = (list) => {
@@ -1096,40 +1120,81 @@
     }
   }
 
-  // Ссылка на медиа: сначала используем транскодинг из поиска, а если его нет
-  // или он устарел — запрашиваем трек целиком.
+  // Ссылка на медиа: сначала используем транскодинг из поиска, а если его нет,
+  // он устарел или не отдался — запрашиваем трек целиком и пробуем остальные
+  // варианты. Перебираем всё, что играет в браузере, прежде чем сдаться.
   async function resolveStream(track) {
+    // DRM-поток (Widevine/FairPlay) браузеру не отдать — его играет только
+    // официальный плеер, поэтому сразу уводим трек туда.
+    if (track.drm) return "drm";
+
     const cached = readStreamCache(track.id);
     if (cached) return cached;
 
     const signal = AbortSignal.timeout(15000);
-    let chosen = track.stream && track.stream.url ? track.stream : null;
-    let media = null;
+    const seen = new Set();
 
-    if (chosen) {
-      try {
-        media = await requestJson(withClientId(chosen.url), signal, 2);
-      } catch (_) {
-        media = null;
+    const attempt = async (list) => {
+      for (const candidate of list) {
+        if (!candidate || !candidate.url || seen.has(candidate.url)) continue;
+        seen.add(candidate.url);
+        try {
+          const media = await requestJson(withClientId(candidate.url), signal, 1);
+          if (media && media.url) {
+            const data = { url: media.url, hls: !!candidate.hls };
+            writeStreamCache(track.id, data);
+            return data;
+          }
+        } catch (_) {
+          /* пробуем следующий вариант */
+        }
       }
+      return null;
+    };
+
+    const candidates = [
+      ...(Array.isArray(track.streams) ? track.streams : []),
+      ...(track.stream && track.stream.url ? [track.stream] : []),
+    ];
+
+    const fromSearch = await attempt(candidates);
+    if (fromSearch) return fromSearch;
+
+    let details = null;
+    try {
+      details = await requestJson(scUrl(`/tracks/${track.id}`, {}), signal, 2);
+    } catch (_) {
+      return null;
     }
 
-    if (!media || !media.url) {
-      const details = await requestJson(scUrl(`/tracks/${track.id}`, {}), signal, 2);
-      chosen = pickTranscoding(
-        details && details.media && details.media.transcodings,
-        details && details.policy
+    const transcodings =
+      details && details.media && Array.isArray(details.media.transcodings)
+        ? details.media.transcodings
+        : [];
+    const fresh = transcodingCandidates(transcodings, details && details.policy);
+    const fromDetails = await attempt(fresh);
+    if (fromDetails) return fromDetails;
+
+    const encrypted =
+      details &&
+      details.embeddable_by !== "none" &&
+      transcodings.some(
+        (item) =>
+          /encrypted-hls/i.test(String(item?.format?.protocol || "")) &&
+          item.snipped !== true
       );
-      // Полного потока нет вовсе (превью, запрет или DRM) — трек не наш.
-      if (!chosen) return "unavailable";
+    if (encrypted) return "drm";
 
-      media = await requestJson(withClientId(chosen.url), signal, 2);
-      if (!media || !media.url) return null;
+    // Превью и запрещённые треки не отдадут полную длину — их не спасает
+    // даже официальный плеер, поэтому честно пропускаем.
+    const access = String((details && details.policy) || "").toUpperCase();
+    if (access === "SNIP" || access === "BLOCK" || !transcodings.length) {
+      return "unavailable";
     }
 
-    const data = { url: media.url, hls: !!chosen.hls };
-    writeStreamCache(track.id, data);
-    return data;
+    // Варианты были, но ни один не отдался (регион, сеть) — пусть попробует
+    // официальный плеер: иногда у него другой маршрут к медиа.
+    return null;
   }
 
   let prefetchTimer = 0;
@@ -1158,14 +1223,22 @@
     );
   }
 
-  function stopNative() {
+  // Официальный плеер — последний аргумент: он умеет DRM-потоки и иногда
+  // играет там, где прямой поток не отдался. Держим его как фолбэк, а не как
+  // основной движок, и возвращаемся к нативному на следующем треке.
+  async function attemptWidget(track, { autoplay = false } = {}) {
+    if (!track) return false;
+    if (!(await ensureWidget())) {
+      engine.current = "native";
+      return false;
+    }
+    // Пока грузился официальный плеер, пользователь мог выбрать другой трек.
+    if (track !== state.current) return true;
+    // Нативный поток мог успеть начаться — глушим его, чтобы не играли два.
     detachNative();
-    const track = state.current;
     engine.current = "widget";
-    ensureWidget().then((ok) => {
-      if (!ok) return;
-      if (track && track === state.current) cueWidget(track, { autoplay: true });
-    });
+    cueWidget(track, { autoplay });
+    return true;
   }
 
   function forgetStream(id) {
@@ -1185,11 +1258,23 @@
     setBuffering(false);
     state.playing = false;
     syncPlayState();
+
     if (nativeFailures >= 2) {
-      stopNative();
+      nativeFailures = 0;
+      attemptWidget(state.current, { autoplay: true }).then((ok) => {
+        if (!ok) handlePlayerError();
+      });
       return;
     }
-    handlePlayerError();
+
+    // Первый сбой — пробуем тот же трек ещё раз со свежей ссылкой.
+    const track = state.current;
+    if (!track) return;
+    window.setTimeout(() => {
+      if (track === state.current && engine.current === "native") {
+        cueTrack(track, { autoplay: true });
+      }
+    }, 400);
   }
 
   async function startNative(track, { autoplay = false } = {}) {
@@ -1214,6 +1299,10 @@
     if (stream === "unavailable") {
       setBuffering(false);
       return "skip";
+    }
+    if (stream === "drm") {
+      setBuffering(false);
+      return "drm";
     }
     if (!stream) {
       setBuffering(false);
@@ -1289,33 +1378,63 @@
     // ссылка на поток ещё запрашивается.
     state.started = true;
 
-    if (engine.current === "native") {
-      let result = await startNative(track, { autoplay });
-      if (result === "ok") return;
-      if (result === "skip") {
-        handlePlayerError();
-        return;
-      }
-
-      // Прокси каталога иногда отвечает 429 — одна короткая повторная попытка.
-      await new Promise((resolve) => window.setTimeout(resolve, 800));
-      result = await startNative(track, { autoplay });
-      if (result === "ok") return;
-      if (result === "skip") {
-        handlePlayerError();
-        return;
-      }
-
-      engine.current = "widget";
-    }
-
-    if (!(await ensureWidget())) {
-      setBuffering(false);
-      toast("не удалось включить трек · проверьте соединение");
+    // DRM-поток иначе не открыть — его играет официальный плеер.
+    if (track.drm) {
+      if (await attemptWidget(track, { autoplay })) return;
+      handlePlayerError();
       return;
     }
 
-    cueWidget(track, { autoplay });
+    // Прошлый трек мог играть через официальный плеер — останавливаем его.
+    if (engine.current === "widget" && scWidget && scReady) {
+      try {
+        scWidget.pause();
+      } catch (_) {
+        /* ignore */
+      }
+    }
+
+    // Основной путь — прямой поток. Официальный плеер оставляем на случай,
+    // если каталог не отдал ссылку или браузер не тянет поток.
+    engine.current = "native";
+
+    let result = await startNative(track, { autoplay });
+    if (track !== state.current) return;
+    if (result === "ok") return;
+    if (result === "skip") {
+      handlePlayerError();
+      return;
+    }
+    if (result === "drm") {
+      if (await attemptWidget(track, { autoplay })) return;
+      handlePlayerError();
+      return;
+    }
+
+    // Прокси каталога иногда отвечает 429 — одна короткая повторная попытка.
+    await new Promise((resolve) => window.setTimeout(resolve, 800));
+    if (track !== state.current) return;
+    result = await startNative(track, { autoplay });
+    if (track !== state.current) return;
+    if (result === "ok") return;
+    if (result === "skip") {
+      handlePlayerError();
+      return;
+    }
+    if (result === "drm") {
+      if (await attemptWidget(track, { autoplay })) return;
+      handlePlayerError();
+      return;
+    }
+
+    // Прямой поток не отдался — пробуем официальный плеер для этого трека.
+    if (await attemptWidget(track, { autoplay })) return;
+    if (track !== state.current) return;
+
+    setBuffering(false);
+    engine.current = "native";
+    toast("не удалось включить трек · проверьте соединение");
+    handlePlayerError();
   }
 
   function cueWidget(track, { autoplay = false } = {}) {
@@ -1689,6 +1808,12 @@
     state.playing = false;
     syncPlayState();
 
+    if (engine.current === "widget") {
+      // Официальный плеер не справился (или недоступен без VPN) — на
+      // следующем треке снова пробуем прямой поток.
+      engine.current = "native";
+    }
+
     toast("трек недоступен · включаем следующий");
 
     errorStreak += 1;
@@ -1808,12 +1933,27 @@
       try {
         scWidget = window.SC.Widget(dom.scPlayer);
         scWidget.bind(window.SC.Widget.Events.READY, handlePlayerReady);
-        scWidget.bind(window.SC.Widget.Events.PLAY, handlePlay);
-        scWidget.bind(window.SC.Widget.Events.PAUSE, handlePause);
-        scWidget.bind(window.SC.Widget.Events.FINISH, handleFinish);
-        scWidget.bind(window.SC.Widget.Events.ERROR, handlePlayerError);
+        // События резервного плеера слушаем только пока он действительно
+        // играет: иначе запоздавший ERROR/PAUSE старого виджета ломал бы
+        // нативное воспроизведение следующего трека.
+        scWidget.bind(window.SC.Widget.Events.PLAY, () => {
+          if (engine.current === "widget") handlePlay();
+        });
+        scWidget.bind(window.SC.Widget.Events.PAUSE, () => {
+          if (engine.current === "widget") handlePause();
+        });
+        scWidget.bind(window.SC.Widget.Events.FINISH, () => {
+          if (engine.current === "widget") handleFinish();
+        });
+        scWidget.bind(window.SC.Widget.Events.ERROR, () => {
+          if (engine.current === "widget") handlePlayerError();
+        });
         scWidget.bind(window.SC.Widget.Events.PLAY_PROGRESS, (event) => {
-          if (event && typeof event.currentPosition === "number") {
+          if (
+            engine.current === "widget" &&
+            event &&
+            typeof event.currentPosition === "number"
+          ) {
             setPosition(event.currentPosition);
           }
         });
